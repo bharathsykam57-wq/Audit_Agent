@@ -1,11 +1,14 @@
+"""Azure Video Indexer service — handles download, upload, polling, and extraction."""
+
 import os
 import time
 import logging
 import requests
-import yt_dlp  
+import yt_dlp
 from azure.identity import DefaultAzureCredential
 
-logger = logging.getLogger("video-indexer")
+logger = logging.getLogger("audit-agent-video-indexer")
+
 
 class VideoIndexerService:
     def __init__(self):
@@ -13,20 +16,20 @@ class VideoIndexerService:
         self.location = os.getenv("AZURE_VI_LOCATION")
         self.subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
         self.resource_group = os.getenv("AZURE_RESOURCE_GROUP")
-        self.vi_name = os.getenv("AZURE_VI_NAME", "project-brand-guardian-001")
+        self.vi_name = os.getenv("AZURE_VI_NAME")
         self.credential = DefaultAzureCredential()
 
     def get_access_token(self):
-        """Generates an ARM Access Token."""
+        """Returns an ARM bearer token via DefaultAzureCredential."""
         try:
             token_object = self.credential.get_token("https://management.azure.com/.default")
             return token_object.token
         except Exception as e:
-            logger.error(f"Failed to get Azure Token: {e}")
+            logger.error(f"ARM token acquisition failed: {e}")
             raise
 
     def get_account_token(self, arm_access_token):
-        """Exchanges ARM token for Video Indexer Account Token."""
+        """Exchanges ARM token for a Video Indexer account-scoped access token."""
         url = (
             f"https://management.azure.com/subscriptions/{self.subscription_id}"
             f"/resourceGroups/{self.resource_group}"
@@ -37,98 +40,87 @@ class VideoIndexerService:
         payload = {"permissionType": "Contributor", "scope": "Account"}
         response = requests.post(url, headers=headers, json=payload)
         if response.status_code != 200:
-            raise Exception(f"Failed to get VI Account Token: {response.text}")
+            raise Exception(f"VI account token request failed: {response.text}")
         return response.json().get("accessToken")
 
-    # --- NEW FUNCTION: Download from YouTube ---
     def download_youtube_video(self, url, output_path="temp_video.mp4"):
-        """Downloads a YouTube video to a local file."""
-        logger.info(f"Downloading YouTube video: {url}")
-        
+        """Downloads a YouTube video to disk using yt-dlp."""
+        logger.info(f"Downloading: {url}")
         ydl_opts = {
-         'format': 'best',
-         'outtmpl': output_path, # output template
-         'quiet': False,
-         'no_warnings': False,
-    # Add these options:
-         'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-         'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-
-}
-        
+            "format": "best",
+            "outtmpl": output_path,
+            "quiet": False,
+            "no_warnings": False,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+        }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
             logger.info("Download complete.")
             return output_path
         except Exception as e:
-            raise Exception(f"YouTube Download Failed: {str(e)}")
+            raise Exception(f"YouTube download failed: {str(e)}")
 
-    # --- UPDATED FUNCTION: Upload Local File ---
     def upload_video(self, video_path, video_name):
-        """Uploads a LOCAL FILE to Azure Video Indexer."""
+        """Uploads a local video file to Azure Video Indexer."""
         arm_token = self.get_access_token()
         vi_token = self.get_account_token(arm_token)
 
         api_url = f"https://api.videoindexer.ai/{self.location}/Accounts/{self.account_id}/Videos"
-        
         params = {
             "accessToken": vi_token,
             "name": video_name,
             "privacy": "Private",
             "indexingPreset": "Default",
-            # We removed "videoUrl" because we are sending a file payload instead
         }
-        
-        logger.info(f"Uploading file {video_path} to Azure...")
-        
-        # Open the file in binary mode and stream it to Azure
-        with open(video_path, 'rb') as video_file:
-            files = {'file': video_file}
-            response = requests.post(api_url, params=params, files=files)
-        
+
+        logger.info(f"Uploading {video_path} to Azure Video Indexer...")
+        with open(video_path, "rb") as video_file:
+            response = requests.post(api_url, params=params, files={"file": video_file})
+
         if response.status_code != 200:
-            raise Exception(f"Azure Upload Failed: {response.text}")
-            
+            raise Exception(f"Upload failed: {response.text}")
         return response.json().get("id")
 
     def wait_for_processing(self, video_id):
-        """Polls status until complete."""
-        logger.info(f"Waiting for video {video_id} to process...")
+        """Polls Azure Video Indexer every 30s until processing completes."""
+        logger.info(f"Polling processing status for video: {video_id}")
         while True:
             arm_token = self.get_access_token()
             vi_token = self.get_account_token(arm_token)
-            
+
             url = f"https://api.videoindexer.ai/{self.location}/Accounts/{self.account_id}/Videos/{video_id}/Index"
-            params = {"accessToken": vi_token}
-            response = requests.get(url, params=params)
+            response = requests.get(url, params={"accessToken": vi_token})
             data = response.json()
-            
             state = data.get("state")
+
             if state == "Processed":
                 return data
             elif state == "Failed":
-                raise Exception("Video Indexing Failed in Azure.")
+                raise Exception("Video indexing failed in Azure.")
             elif state == "Quarantined":
-                raise Exception("Video Quarantined (Copyright/Content Policy Violation).")
-            
-            logger.info(f"Status: {state}... waiting 30s")
+                raise Exception("Video quarantined — possible copyright or content policy violation.")
+
+            logger.info(f"Status: {state} — retrying in 30s")
             time.sleep(30)
 
     def extract_data(self, vi_json):
-        """Parses the JSON into our State format."""
-        transcript_lines = []
-        for v in vi_json.get("videos", []):
-            for insight in v.get("insights", {}).get("transcript", []):
-                transcript_lines.append(insight.get("text"))
-        
-        ocr_lines = []
-        for v in vi_json.get("videos", []):
-            for insight in v.get("insights", {}).get("ocr", []):
-                ocr_lines.append(insight.get("text"))
-                
+        """Extracts transcript, OCR text, and metadata from Video Indexer response."""
+        transcript_lines = [
+            insight.get("text")
+            for v in vi_json.get("videos", [])
+            for insight in v.get("insights", {}).get("transcript", [])
+        ]
+
+        ocr_lines = [
+            insight.get("text")
+            for v in vi_json.get("videos", [])
+            for insight in v.get("insights", {}).get("ocr", [])
+        ]
+
         return {
             "transcript": " ".join(transcript_lines),
             "ocr_text": ocr_lines,
