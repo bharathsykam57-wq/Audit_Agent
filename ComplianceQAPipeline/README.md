@@ -170,4 +170,4 @@ curl -X POST http://localhost:8000/audit \
 
 ## Architecture Decisions
 
-See [DECISIONS.md](DECISIONS.md) for reasoning behind LangGraph vs chains, Azure AI Search vs FAISS, RAG vs fine-tuning, and other design choices.
+See `decisions.md` for reasoning behind LangGraph vs chains, Azure AI Search vs FAISS, RAG vs fine-tuning, and other design choices.
