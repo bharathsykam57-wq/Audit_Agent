@@ -78,7 +78,7 @@ async def audit_video(request: AuditRequest):
             detail=f"Workflow execution failed: {str(e)}"
         )
 
-
+# Health check endpoint
 @app.get("/health")
 def health_check():
     """Returns API health status."""
